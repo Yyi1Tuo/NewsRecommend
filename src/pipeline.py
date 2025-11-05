@@ -41,7 +41,7 @@ def run(topk_submit: int = 5) -> Path:
     item_topk_click = data_mod.get_item_topk_click(all_click_df, k=ITEM_TOPK_K)
 
     # 召回
-    user_recall_items_dict: Dict[int, List[Tuple[int, float]]] = defaultdict(list)
+    user_recall_items_dict: Dict[int, List[Tuple[int, float]]] = defaultdict[int, List[Tuple[int, float]]](list) # 类型注解：字典[用户ID, 推荐文章列表]
     for user in tqdm(all_click_df["user_id"].unique()):
         recs = recall.item_based_recommend(
             user_id=user,

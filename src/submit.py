@@ -27,7 +27,7 @@ def submit(recall_df: pd.DataFrame, topk: int = 5, model_name: Optional[str] = N
 
     if model_name is None:
         model_name = "itemcf"
-    save_name = SAVE_PATH / f"{model_name}_" f"{datetime.today().strftime('%m-%d')}.csv"
+    save_name = SAVE_PATH / f"{model_name}_" f"{datetime.today().strftime('%m-%d-%H-%M')}.csv"
     submit_df.to_csv(save_name, index=False, header=True)
     return save_name
 

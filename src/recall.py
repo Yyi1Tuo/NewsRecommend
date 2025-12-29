@@ -12,13 +12,15 @@ def item_based_recommend(
     """
     基于文章协同过滤的召回，返回 [(item, score), ...]
     """
+    # 取出用户历史点击记录，防止后面重复推荐
     user_hist_items = user_item_time_dict[user_id]
     user_hist_item_ids = {item_id for item_id, _ in user_hist_items}
 
     item_rank: Dict[int, float] = {}
     for _, (i, _) in enumerate(user_hist_items):
-        if i not in i2i_sim:
+        if i not in i2i_sim:#如果文章不在相似度矩阵中则跳过（例如新物品）
             continue
+        ##取最相似的 TopK 物品
         for j, wij in sorted(i2i_sim[i].items(), key=lambda x: x[1], reverse=True)[:sim_item_topk]:
             if j in user_hist_item_ids:
                 continue

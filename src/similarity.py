@@ -12,7 +12,7 @@ from .data import get_user_item_time
 
 def itemcf_sim(df: pd.DataFrame) -> Dict[int, Dict[int, float]]:
     """
-    计算文章与文章之间的相似性矩阵（ItemCF）。
+    计算文章与文章之间的相似性矩阵(ItemCF)。
     """
     user_item_time_dict = get_user_item_time(df)
 

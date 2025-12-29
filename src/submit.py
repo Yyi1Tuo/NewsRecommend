@@ -23,11 +23,16 @@ def submit(recall_df: pd.DataFrame, topk: int = 5, model_name: Optional[str] = N
     )
 
     submit_df.columns = [int(col) if isinstance(col, int) else col for col in submit_df.columns.droplevel(0)]
-    submit_df = submit_df.rename(columns={"": "user_id", 1: "article_1", 2: "article_2", 3: "article_3", 4: "article_4", 5: "article_5"})
+    
+    # 动态构建列名
+    rename_dict = {"": "user_id"}
+    for i in range(1, topk + 1):
+        rename_dict[i] = f"article_{i}"
+    submit_df = submit_df.rename(columns=rename_dict)
 
     if model_name is None:
         model_name = "itemcf"
-    save_name = SAVE_PATH / f"{model_name}_" f"{datetime.today().strftime('%m-%d-%H-%M')}.csv"
+    save_name = SAVE_PATH / f"{model_name}_" f"{datetime.today().strftime('%m-%d-%H-%M-%S')}.csv"
     submit_df.to_csv(save_name, index=False, header=True)
     return save_name
 

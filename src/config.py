@@ -21,4 +21,18 @@ MODEL_NAME: str = "itemcf_baseline"
 # 相似度矩阵文件名
 I2I_SIM_FILENAME: str = "itemcf_i2i_sim.pkl"
 
+# 多路召回配置
+MULTI_RECALL_WEIGHTS = {
+    'itemcf': 0.3,
+    'usercf': 0.25,
+    'two_tower': 0.25,
+    'hot': 0.1,
+    'time_decay': 0.05,
+    'cold_start': 0.05
+}
+
+# 双塔模型配置
+TWO_TOWER_EMBEDDING_DIM: int = 64
+TWO_TOWER_EPOCHS: int = 10
+
 

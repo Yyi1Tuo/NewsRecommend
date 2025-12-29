@@ -81,7 +81,6 @@ def get_all_click_df(data_path: str = None, offline: bool = True) -> pd.DataFram
     else:
         trn_click = pd.read_csv(str(base / "train_click_log.csv"))
         tst_click = pd.read_csv(str(base / "testA_click_log.csv"))
-        # 线上模式：训练+测试拼接（pandas>=2.0 移除了 DataFrame.append，使用 concat）
         all_click = pd.concat([trn_click, tst_click], ignore_index=True)
 
     # 去重，防止重复点击记录影响统计

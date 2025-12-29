@@ -28,7 +28,7 @@ def item_based_recommend(
     # 不足 recall_item_num，用热门补全
     if len(item_rank) < recall_item_num:
         for idx, item in enumerate(item_topk_click):
-            if item in item_rank:  # 修复：判断是否在 key 中
+            if item in item_rank or item in user_hist_item_ids:  # 过滤已在召回中的和历史中的
                 continue
             item_rank[item] = -idx - 100.0
             if len(item_rank) == recall_item_num:

@@ -1,4 +1,18 @@
-pandas>=1.5
-numpy>=1.23
-tqdm>=4.65
+# 新闻推荐系统依赖
 
+# 核心依赖
+pandas>=1.5.0
+numpy>=1.23.0
+scikit-learn>=1.2.0
+tqdm>=4.65.0
+
+# GPU加速（推荐）
+torch>=2.0.0
+# 如果有CUDA，使用以下命令安装PyTorch:
+# pip install torch --index-url https://download.pytorch.org/whl/cu118
+
+# 系统监控
+psutil>=5.9.0
+
+# 可选：更好的性能
+# numba>=0.57.0  # JIT编译加速

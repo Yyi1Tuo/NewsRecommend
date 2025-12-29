@@ -63,7 +63,7 @@ def get_all_click_df(data_path: str = None, offline: bool = True) -> pd.DataFram
     else:
         trn_click = pd.read_csv(str(base / "train_click_log.csv"))
         tst_click = pd.read_csv(str(base / "testA_click_log.csv"))
-        all_click = trn_click.append(tst_click)
+        all_click = pd.concat([trn_click, tst_click], ignore_index=True)
 
     all_click = all_click.drop_duplicates(["user_id", "click_article_id", "click_timestamp"]) 
     return all_click

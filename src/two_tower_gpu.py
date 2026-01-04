@@ -120,24 +120,58 @@ def train_two_tower_gpu(
     pos_interactions = click_data[['user_idx', 'item_idx']].values
     pos_labels = np.ones(len(pos_interactions))
     
-    # 负采样（内存优化：只采样等量负样本）
+    print(f"正样本数量: {len(pos_interactions)}")
+    print(f"正样本示例: user_idx={pos_interactions[0]}, item_idx={pos_interactions[1]}")
+    
+    # 负采样（内存优化：采样等量负样本，避免真实正样本）
     n_users = len(user_features)
     n_items = len(item_features)
-    n_neg = min(len(pos_interactions), 50000)  # 限制负样本数量
+    n_neg = min(len(pos_interactions), 100000)  # 增加负样本数量以提升训练效果
     
-    print(f"正样本: {len(pos_interactions)}, 负样本: {n_neg}")
+    # 构建正样本集合用于过滤
+    pos_set = set(map(tuple, pos_interactions))
+    print(f"构建正样本哈希表: {len(pos_set)} 个正样本")
     
-    neg_users = np.random.randint(0, n_users, n_neg)
-    neg_items = np.random.randint(0, n_items, n_neg)
-    neg_interactions = np.column_stack([neg_users, neg_items])
-    neg_labels = np.zeros(n_neg)
+    # 负采样（过滤掉真实正样本）
+    neg_samples = []
+    attempts = 0
+    max_attempts = n_neg * 10
+    
+    print("开始负采样...")
+    while len(neg_samples) < n_neg and attempts < max_attempts:
+        batch_size_neg = min(10000, n_neg - len(neg_samples))
+        neg_users = np.random.randint(0, n_users, batch_size_neg)
+        neg_items = np.random.randint(0, n_items, batch_size_neg)
+        
+        for u, i in zip(neg_users, neg_items):
+            if (u, i) not in pos_set:
+                neg_samples.append([u, i])
+                if len(neg_samples) >= n_neg:
+                    break
+        
+        attempts += batch_size_neg
+        if len(neg_samples) % 10000 == 0:
+            print(f"  已采样 {len(neg_samples)} / {n_neg} 负样本")
+    
+    neg_interactions = np.array(neg_samples)
+    neg_labels = np.zeros(len(neg_interactions))
+    
+    print(f"负采样完成: {len(neg_interactions)} 个负样本")
+    print(f"正负样本比: 1:{len(neg_interactions)/len(pos_interactions):.2f}")
     
     # 合并正负样本
     all_interactions = np.vstack([
         np.column_stack([pos_interactions, pos_labels]),
         np.column_stack([neg_interactions, neg_labels])
     ])
+    
+    # 打乱
     np.random.shuffle(all_interactions)
+    
+    # 验证标签分布
+    labels_check = all_interactions[:, 2]
+    print(f"标签分布: 正样本={np.sum(labels_check == 1)}, 负样本={np.sum(labels_check == 0)}")
+    print(f"标签均值: {np.mean(labels_check):.4f}")
     
     # 释放内存
     del pos_interactions, neg_interactions, pos_labels, neg_labels
@@ -160,13 +194,18 @@ def train_two_tower_gpu(
     # 训练
     model.train()
     print(f"\n开始训练双塔模型 ({epochs} epochs)...")
+    print(f"训练集大小: {len(dataset)}")
+    print(f"批次数: {len(dataloader)}")
+    print(f"学习率: {optimizer.param_groups[0]['lr']}")
     
     for epoch in range(epochs):
         total_loss = 0
         batch_count = 0
+        pos_scores = []
+        neg_scores = []
         
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
-        for user_feat, item_feat, labels in pbar:
+        for batch_idx, (user_feat, item_feat, labels) in enumerate(pbar):
             user_feat = user_feat.to(device)
             item_feat = item_feat.to(device)
             labels = labels.to(device).squeeze()
@@ -175,16 +214,53 @@ def train_two_tower_gpu(
             scores = model(user_feat, item_feat)
             loss = criterion(scores, labels)
             loss.backward()
+            
+            # 梯度裁剪防止梯度爆炸
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
             
             total_loss += loss.item()
             batch_count += 1
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            
+            # 记录正负样本分数
+            with torch.no_grad():
+                pos_mask = labels > 0.5
+                neg_mask = labels < 0.5
+                if pos_mask.sum() > 0:
+                    pos_scores.extend(scores[pos_mask].cpu().numpy().tolist())
+                if neg_mask.sum() > 0:
+                    neg_scores.extend(scores[neg_mask].cpu().numpy().tolist())
+            
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'pos_score': f'{scores[pos_mask].mean().item():.4f}' if pos_mask.sum() > 0 else 'N/A',
+                'neg_score': f'{scores[neg_mask].mean().item():.4f}' if neg_mask.sum() > 0 else 'N/A'
+            })
+            
+            # 每100个batch打印详细信息
+            if batch_idx > 0 and batch_idx % 100 == 0:
+                print(f"\n  Batch {batch_idx}: loss={loss.item():.4f}, "
+                      f"scores范围=[{scores.min().item():.4f}, {scores.max().item():.4f}], "
+                      f"labels分布: pos={pos_mask.sum().item()}, neg={neg_mask.sum().item()}")
         
         avg_loss = total_loss / batch_count
-        print(f"Epoch {epoch+1}/{epochs}, 平均损失: {avg_loss:.4f}")
+        avg_pos_score = np.mean(pos_scores) if pos_scores else 0
+        avg_neg_score = np.mean(neg_scores) if neg_scores else 0
+        
+        print(f"\nEpoch {epoch+1}/{epochs}:")
+        print(f"  平均损失: {avg_loss:.4f}")
+        print(f"  正样本平均分数: {avg_pos_score:.4f}")
+        print(f"  负样本平均分数: {avg_neg_score:.4f}")
+        print(f"  分数差异: {avg_pos_score - avg_neg_score:.4f}")
+        
+        # 检查是否训练正常
+        if avg_loss < 0.01:
+            print(f"  ⚠️ 警告: 损失过小 ({avg_loss:.4f})，可能存在训练问题")
+        if abs(avg_pos_score - avg_neg_score) < 0.1:
+            print(f"  ⚠️ 警告: 正负样本分数差异太小，模型可能未学习到有效特征")
     
-    print("双塔模型训练完成")
+    print("\n双塔模型训练完成")
     
     # 保存模型
     torch.save(model.state_dict(), SAVE_PATH / 'two_tower_gpu.pth')

@@ -295,7 +295,17 @@ def run_multi_gpu(
         
         print(f"  批次 {batch_idx+1}/{n_batches}: {start_idx}-{end_idx}")
         
-        for user in tqdm(batch_users, desc=f"召回{batch_idx+1}"):
+        # 统计信息
+        batch_stats = {
+            'itemcf_success': 0,
+            'itemcf_fail': 0,
+            'two_tower_success': 0,
+            'two_tower_fail': 0,
+            'itemcf_items': [],
+            'two_tower_items': []
+        }
+        
+        for user_idx, user in enumerate(tqdm(batch_users, desc=f"召回{batch_idx+1}")):
             recall_results = {}
             
             # ItemCF召回
@@ -310,8 +320,14 @@ def run_multi_gpu(
                         item_topk_click=item_topk_click,
                     )
                     recall_results['itemcf'] = itemcf_recs
-                except:
+                    batch_stats['itemcf_success'] += 1
+                    if itemcf_recs:
+                        batch_stats['itemcf_items'].append(len(itemcf_recs))
+                except Exception as e:
                     recall_results['itemcf'] = []
+                    batch_stats['itemcf_fail'] += 1
+                    if user_idx == 0:  # 只打印第一个用户的错误
+                        print(f"\n  ItemCF召回失败: {e}")
             
             # 双塔召回
             if use_two_tower and two_tower_model:
@@ -329,19 +345,75 @@ def run_multi_gpu(
                         device=device
                     )
                     recall_results['two_tower'] = tt_recs
-                except:
+                    batch_stats['two_tower_success'] += 1
+                    if tt_recs:
+                        batch_stats['two_tower_items'].append(len(tt_recs))
+                    
+                    # 调试：打印第一个用户的召回结果
+                    if user_idx == 0 and batch_idx == 0:
+                        print(f"\n  [调试] 用户{user}:")
+                        print(f"    ItemCF召回: {len(itemcf_recs) if 'itemcf' in recall_results else 0} 个")
+                        if itemcf_recs:
+                            print(f"      示例: {itemcf_recs[:3]}")
+                        print(f"    双塔召回: {len(tt_recs)} 个")
+                        if tt_recs:
+                            print(f"      示例: {tt_recs[:3]}")
+                        
+                except Exception as e:
                     recall_results['two_tower'] = []
+                    batch_stats['two_tower_fail'] += 1
+                    if user_idx == 0:  # 只打印第一个用户的错误
+                        print(f"\n  双塔召回失败: {e}")
+                        import traceback
+                        traceback.print_exc()
             
-            # 简单融合（加权平均）
+            # 融合：归一化分数后加权
             item_scores = defaultdict(float)
-            for strategy, items in recall_results.items():
-                weight = 0.6 if strategy == 'itemcf' else 0.4
-                for item, score in items:
-                    item_scores[item] += weight * score
             
-            # 排序
-            final_recs = sorted(item_scores.items(), key=lambda x: x[1], reverse=True)[:RECALL_ITEM_NUM * 2]
+            for strategy, items in recall_results.items():
+                if not items:
+                    continue
+                
+                # 归一化分数到 [0, 1]
+                scores = [s for _, s in items]
+                if len(scores) > 0:
+                    min_score = min(scores)
+                    max_score = max(scores)
+                    if max_score > min_score:
+                        norm_items = [
+                            (item, (score - min_score) / (max_score - min_score))
+                            for item, score in items
+                        ]
+                    else:
+                        norm_items = [(item, 1.0) for item, _ in items]
+                else:
+                    norm_items = items
+                
+                # 加权
+                weight = 0.5 if strategy == 'itemcf' else 0.5  # 平等权重
+                for item, norm_score in norm_items:
+                    item_scores[item] += weight * norm_score
+            
+            # 排序并取TopK
+            if item_scores:
+                final_recs = sorted(item_scores.items(), key=lambda x: x[1], reverse=True)[:RECALL_ITEM_NUM * 2]
+            else:
+                # 如果没有召回，使用热门
+                final_recs = [(item, 1.0 - idx*0.01) for idx, item in enumerate(item_topk_click[:RECALL_ITEM_NUM])]
+            
             user_recall_dict[user] = final_recs
+            
+            # 调试：打印第一个用户的融合结果
+            if user_idx == 0 and batch_idx == 0:
+                print(f"    融合后: {len(final_recs)} 个")
+                print(f"      示例: {final_recs[:5]}")
+        
+        # 打印批次统计
+        print(f"\n  批次{batch_idx+1}统计:")
+        print(f"    ItemCF: 成功={batch_stats['itemcf_success']}, 失败={batch_stats['itemcf_fail']}, "
+              f"平均召回={np.mean(batch_stats['itemcf_items']) if batch_stats['itemcf_items'] else 0:.1f}个")
+        print(f"    双塔: 成功={batch_stats['two_tower_success']}, 失败={batch_stats['two_tower_fail']}, "
+              f"平均召回={np.mean(batch_stats['two_tower_items']) if batch_stats['two_tower_items'] else 0:.1f}个")
         
         # 定期清理
         if (batch_idx + 1) % 3 == 0:

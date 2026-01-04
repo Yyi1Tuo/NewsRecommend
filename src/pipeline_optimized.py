@@ -1,10 +1,10 @@
 """内存优化版 Pipeline - 支持分批处理和GPU加速"""
 import pickle
 import gc
-import psutil
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
+from time import perf_counter
 
 import numpy as np
 import pandas as pd
@@ -26,17 +26,9 @@ from . import recall
 from . import submit as submit_mod
 
 
-def get_memory_usage():
-    """获取当前内存使用情况（MB）"""
-    process = psutil.Process()
-    return process.memory_info().rss / 1024 / 1024
-
-
-def print_memory_stats(stage=""):
-    """打印内存统计"""
-    mem_used = get_memory_usage()
-    mem_available = psutil.virtual_memory().available / 1024 / 1024
-    print(f"[{stage}] 内存使用: {mem_used:.1f}MB, 可用: {mem_available:.1f}MB")
+def _log(msg: str):
+    # 统一日志入口，便于后续更进一步降噪/重定向
+    print(msg)
 
 
 def run_lightweight(
@@ -52,47 +44,34 @@ def run_lightweight(
         use_gpu: 是否使用GPU（如果可用）
         batch_size: 每批处理的用户数
     """
-    print("=" * 70)
-    print("轻量级推荐系统 - 内存优化版")
-    print("=" * 70)
-    
-    # 检测GPU
-    device = 'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
-    print(f"计算设备: {device}")
-    if device == 'cuda':
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"GPU内存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
-    
-    print_memory_stats("启动")
+    # 轻量模式保留，但减少冗余输出
+    t0 = perf_counter()
     
     # 1. 加载数据（只读必要字段）
-    print("\n[1/5] 加载数据...")
+    _log("加载数据...")
     all_click_df = data_mod.get_all_click_df(offline=False)
-    print(f"点击数据: {len(all_click_df)} 条")
-    print_memory_stats("数据加载")
+    _log(f"点击数据: {len(all_click_df)}")
     
     # 2. 基础统计
-    print("\n[2/5] 计算基础统计...")
+    _log("计算基础统计...")
     user_item_time_dict = data_mod.get_user_item_time(all_click_df)
     item_topk_click = data_mod.get_item_topk_click(all_click_df, k=ITEM_TOPK_K).tolist()
     
     # 获取所有用户
     all_users = all_click_df["user_id"].unique()
-    print(f"用户数: {len(all_users)}")
-    print_memory_stats("统计完成")
+    _log(f"用户数: {len(all_users)}")
     
     # 3. ItemCF 相似度（如果不存在才计算）
-    print("\n[3/5] 准备ItemCF相似度...")
+    _log("准备ItemCF相似度...")
     i2i_sim = _load_or_build_i2i(all_click_df)
-    print_memory_stats("相似度加载")
     
     # 释放不需要的数据
     del all_click_df
     gc.collect()
-    print_memory_stats("释放数据")
+    # no-op
     
     # 4. 分批召回
-    print(f"\n[4/5] 分批召回（批大小: {batch_size}）...")
+    _log(f"分批召回: batch_size={batch_size}")
     user_recall_dict = {}
     
     n_batches = (len(all_users) + batch_size - 1) // batch_size
@@ -102,9 +81,7 @@ def run_lightweight(
         end_idx = min(start_idx + batch_size, len(all_users))
         batch_users = all_users[start_idx:end_idx]
         
-        print(f"  批次 {batch_idx+1}/{n_batches}: 处理用户 {start_idx}-{end_idx}")
-        
-        for user in tqdm(batch_users, desc=f"召回批次{batch_idx+1}"):
+        for user in tqdm(batch_users, desc=f"召回{batch_idx+1}/{n_batches}"):
             recs = recall.item_based_recommend(
                 user_id=user,
                 user_item_time_dict=user_item_time_dict,
@@ -115,16 +92,13 @@ def run_lightweight(
             )
             user_recall_dict[user] = recs
         
-        # 定期清理内存
         if (batch_idx + 1) % 5 == 0:
             gc.collect()
-            print_memory_stats(f"批次{batch_idx+1}完成")
     
-    print(f"召回完成，共 {len(user_recall_dict)} 个用户")
-    print_memory_stats("召回完成")
+    _log(f"召回完成: users={len(user_recall_dict)}")
     
     # 5. 转换为DataFrame（流式处理）
-    print("\n[5/5] 生成提交文件...")
+    _log("生成提交文件...")
     
     # 只保留测试集用户
     tst_click = pd.read_csv(str(DATA_PATH / "testA_click_log.csv"))
@@ -142,15 +116,12 @@ def run_lightweight(
         columns=["user_id", "click_article_id", "pred_score"]
     )
     
-    print(f"测试集召回: {len(recall_df)} 条")
-    print_memory_stats("结果构建")
+    _log(f"测试集召回: {len(recall_df)}")
     
     # 生成提交
     submit_path = submit_mod.submit(recall_df, topk=topk_submit, model_name=f"{MODEL_NAME}_lite")
     
-    print(f"\n提交文件: {submit_path}")
-    print_memory_stats("完成")
-    print("=" * 70)
+    _log(f"完成: submit={submit_path}, elapsed={perf_counter()-t0:.2f}s")
     
     return submit_path
 
@@ -174,52 +145,42 @@ def run_multi_gpu(
         batch_size: 批大小
         device: 计算设备
     """
-    print("=" * 70)
-    print("多路召回系统 - GPU优化版")
-    print("=" * 70)
-    
-    # 检测GPU
-    if device == 'cuda' and not torch.cuda.is_available():
-        print("警告: CUDA不可用，切换到CPU")
-        device = 'cpu'
-    
-    print(f"计算设备: {device}")
-    if device == 'cuda':
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"GPU显存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
-    
-    print_memory_stats("启动")
+    t0 = perf_counter()
+    if device != "cuda":
+        device = "cuda"
+    if not torch.cuda.is_available():
+        raise RuntimeError("仅保留GPU版本：当前环境 CUDA 不可用")
+    _log("启动多路召回(GPU)...")
     
     # 1. 加载数据
-    print("\n[1/5] 加载数据...")
+    _log("加载数据...")
     all_click_df = data_mod.get_all_click_df(offline=False)
     user_item_time_dict = data_mod.get_user_item_time(all_click_df)
     item_topk_click = data_mod.get_item_topk_click(all_click_df, k=ITEM_TOPK_K).tolist()
     all_users = all_click_df["user_id"].unique()
-    
-    print(f"用户: {len(all_users)}, 点击: {len(all_click_df)}")
-    print_memory_stats("数据加载")
+    _log(f"用户: {len(all_users)}, 点击: {len(all_click_df)}")
     
     # 2. 准备召回资源
-    print("\n[2/5] 准备召回资源...")
+    _log("准备召回资源...")
     
     i2i_sim = None
     if use_itemcf:
         i2i_sim = _load_or_build_i2i(all_click_df)
-        print("ItemCF 相似度已加载")
+        _log("ItemCF 相似度已就绪")
     
     two_tower_model = None
     item_embeddings = None
-    user_features_dict = None
     item_encoder = None
+    user_features = None
+    user_id_to_row = None
+    item_ids_by_index = None
     
     if use_two_tower:
         if train_two_tower or not (SAVE_PATH / 'two_tower_gpu.pth').exists():
-            print("\n训练双塔模型...")
             from . import features as feat_mod
             from . import two_tower_gpu
             
-            # 提取特征
+            _log("训练双塔模型...")
             user_df = feat_mod.extract_user_features(all_click_df)
             item_df = feat_mod.extract_item_features(all_click_df)
             user_features, item_features, encoders = feat_mod.build_feature_matrix(
@@ -243,7 +204,6 @@ def run_multi_gpu(
         
         # 加载模型和向量
         if (SAVE_PATH / 'two_tower_gpu.pth').exists():
-            print("加载双塔模型...")
             from . import two_tower_gpu
             from . import features as feat_mod
             
@@ -254,36 +214,34 @@ def run_multi_gpu(
             
             encoders = feat_mod.load_feature_encoders()
             item_encoder = encoders['item_encoder']
-            
-            # 构建用户特征字典（轻量级）
+
+            # 构建用户特征矩阵（与 encoders 对齐）
             user_df = feat_mod.extract_user_features(all_click_df)
-            user_features, _, _ = feat_mod.build_feature_matrix(
-                all_click_df, user_df, 
-                feat_mod.extract_item_features(all_click_df)
-            )
-            user_encoder = encoders['user_encoder']
-            user_features_dict = {
-                uid: user_features[user_encoder.transform([uid])[0]]
-                for uid in all_users
-            }
-            
-            del user_df, user_features
+            user_feat_cols = encoders['user_feat_cols']
+            user_scaler = encoders['user_scaler']
+            user_features = user_scaler.transform(user_df[user_feat_cols].fillna(0)).astype(np.float32)
+            user_ids = user_df['user_id'].values
+            user_id_to_row = {int(uid): int(i) for i, uid in enumerate(user_ids)}
+
+            item_ids_by_index = getattr(item_encoder, "classes_", None)
+            if item_ids_by_index is None:
+                item_ids_by_index = item_encoder.inverse_transform(np.arange(len(item_embeddings)))
+
+            del user_df
             gc.collect()
-            
-            print("双塔模型已加载")
+            _log("双塔模型与向量已就绪")
     
-    print_memory_stats("资源准备")
+    _log("资源准备完成")
     
     # 释放原始数据
     del all_click_df
     gc.collect()
     if device == 'cuda':
         torch.cuda.empty_cache()
-    
-    print_memory_stats("释放数据")
+    # no-op
     
     # 3. 分批召回
-    print(f"\n[3/5] 分批多路召回（批大小: {batch_size}）...")
+    _log(f"开始召回: batch_size={batch_size}")
     user_recall_dict = {}
     
     n_batches = (len(all_users) + batch_size - 1) // batch_size
@@ -293,19 +251,30 @@ def run_multi_gpu(
         end_idx = min(start_idx + batch_size, len(all_users))
         batch_users = all_users[start_idx:end_idx]
         
-        print(f"  批次 {batch_idx+1}/{n_batches}: {start_idx}-{end_idx}")
-        
-        # 统计信息
-        batch_stats = {
-            'itemcf_success': 0,
-            'itemcf_fail': 0,
-            'two_tower_success': 0,
-            'two_tower_fail': 0,
-            'itemcf_items': [],
-            'two_tower_items': []
-        }
-        
-        for user_idx, user in enumerate(tqdm(batch_users, desc=f"召回{batch_idx+1}")):
+        # 先批量做双塔召回（避免 per-user 全量 dot/sort）
+        tt_batch = {}
+        if use_two_tower and two_tower_model and item_embeddings is not None and user_features is not None:
+            from . import two_tower_gpu
+            user_hist_items_dict = {
+                int(u): {item_id for item_id, _ in user_item_time_dict.get(int(u), [])}
+                for u in batch_users
+            }
+            tt_batch = two_tower_gpu.two_tower_recall_batch(
+                user_ids=[int(u) for u in batch_users],
+                user_features=user_features,
+                user_id_to_row=user_id_to_row,
+                item_embeddings=item_embeddings,
+                item_ids_by_index=item_ids_by_index,
+                model=two_tower_model,
+                user_hist_items_dict=user_hist_items_dict,
+                recall_num=RECALL_ITEM_NUM,
+                device=device,
+                batch_size=max(256, min(4096, batch_size)),
+                use_faiss=True,
+            )
+
+        for user in tqdm(batch_users, desc=f"召回{batch_idx+1}/{n_batches}"):
+            user = int(user)
             recall_results = {}
             
             # ItemCF召回
@@ -320,52 +289,13 @@ def run_multi_gpu(
                         item_topk_click=item_topk_click,
                     )
                     recall_results['itemcf'] = itemcf_recs
-                    batch_stats['itemcf_success'] += 1
-                    if itemcf_recs:
-                        batch_stats['itemcf_items'].append(len(itemcf_recs))
                 except Exception as e:
                     recall_results['itemcf'] = []
-                    batch_stats['itemcf_fail'] += 1
-                    if user_idx == 0:  # 只打印第一个用户的错误
-                        print(f"\n  ItemCF召回失败: {e}")
+                    # 静默失败：走后续兜底
             
             # 双塔召回
             if use_two_tower and two_tower_model:
-                try:
-                    from . import two_tower_gpu
-                    user_hist_items = {item_id for item_id, _ in user_item_time_dict.get(user, [])}
-                    tt_recs = two_tower_gpu.two_tower_recall_gpu(
-                        user_id=user,
-                        user_features_dict=user_features_dict,
-                        item_embeddings=item_embeddings,
-                        item_encoder=item_encoder,
-                        model=two_tower_model,
-                        user_hist_items=user_hist_items,
-                        recall_num=RECALL_ITEM_NUM,
-                        device=device
-                    )
-                    recall_results['two_tower'] = tt_recs
-                    batch_stats['two_tower_success'] += 1
-                    if tt_recs:
-                        batch_stats['two_tower_items'].append(len(tt_recs))
-                    
-                    # 调试：打印第一个用户的召回结果
-                    if user_idx == 0 and batch_idx == 0:
-                        print(f"\n  [调试] 用户{user}:")
-                        print(f"    ItemCF召回: {len(itemcf_recs) if 'itemcf' in recall_results else 0} 个")
-                        if itemcf_recs:
-                            print(f"      示例: {itemcf_recs[:3]}")
-                        print(f"    双塔召回: {len(tt_recs)} 个")
-                        if tt_recs:
-                            print(f"      示例: {tt_recs[:3]}")
-                        
-                except Exception as e:
-                    recall_results['two_tower'] = []
-                    batch_stats['two_tower_fail'] += 1
-                    if user_idx == 0:  # 只打印第一个用户的错误
-                        print(f"\n  双塔召回失败: {e}")
-                        import traceback
-                        traceback.print_exc()
+                recall_results['two_tower'] = tt_batch.get(user, [])
             
             # 融合：归一化分数后加权
             item_scores = defaultdict(float)
@@ -402,31 +332,17 @@ def run_multi_gpu(
                 final_recs = [(item, 1.0 - idx*0.01) for idx, item in enumerate(item_topk_click[:RECALL_ITEM_NUM])]
             
             user_recall_dict[user] = final_recs
-            
-            # 调试：打印第一个用户的融合结果
-            if user_idx == 0 and batch_idx == 0:
-                print(f"    融合后: {len(final_recs)} 个")
-                print(f"      示例: {final_recs[:5]}")
-        
-        # 打印批次统计
-        print(f"\n  批次{batch_idx+1}统计:")
-        print(f"    ItemCF: 成功={batch_stats['itemcf_success']}, 失败={batch_stats['itemcf_fail']}, "
-              f"平均召回={np.mean(batch_stats['itemcf_items']) if batch_stats['itemcf_items'] else 0:.1f}个")
-        print(f"    双塔: 成功={batch_stats['two_tower_success']}, 失败={batch_stats['two_tower_fail']}, "
-              f"平均召回={np.mean(batch_stats['two_tower_items']) if batch_stats['two_tower_items'] else 0:.1f}个")
         
         # 定期清理
         if (batch_idx + 1) % 3 == 0:
             gc.collect()
             if device == 'cuda':
                 torch.cuda.empty_cache()
-            print_memory_stats(f"批次{batch_idx+1}")
     
-    print(f"召回完成: {len(user_recall_dict)} 用户")
-    print_memory_stats("召回完成")
+    _log(f"召回完成: users={len(user_recall_dict)}, elapsed={perf_counter()-t0:.2f}s")
     
     # 4. 构建结果
-    print("\n[4/5] 构建提交...")
+    _log("构建提交...")
     tst_click = pd.read_csv(str(DATA_PATH / "testA_click_log.csv"))
     tst_users = set(tst_click["user_id"].unique())
     
@@ -441,16 +357,12 @@ def run_multi_gpu(
         columns=["user_id", "click_article_id", "pred_score"]
     )
     
-    print(f"测试集: {len(recall_df)} 条")
-    print_memory_stats("结果构建")
+    _log(f"测试集: {len(recall_df)}")
     
     # 5. 生成提交
     model_name = f"{MODEL_NAME}_multi_gpu"
     submit_path = submit_mod.submit(recall_df, topk=topk_submit, model_name=model_name)
-    
-    print(f"\n提交文件: {submit_path}")
-    print_memory_stats("完成")
-    print("=" * 70)
+    _log(f"完成: submit={submit_path}, total_elapsed={perf_counter()-t0:.2f}s")
     
     return submit_path
 

@@ -93,17 +93,20 @@ def build_feature_matrix(
     构建用户-物品特征矩阵用于双塔模型训练
     返回：(user_features, item_features, encoders)
     """
-    # 合并特征
+    # 合并特征（训练样本用）
     click_with_features = all_click_df.merge(user_df, on='user_id', how='left')
     click_with_features = click_with_features.merge(item_df, on='click_article_id', how='left')
     
-    # 用户ID编码
+    # IMPORTANT:
+    # user_features_scaled / item_features_scaled 的行顺序分别来自 user_df / item_df。
+    # 因此 encoder 必须在 user_df / item_df 的 id 序列上 fit，才能保证 idx 与矩阵行严格对齐。
     user_encoder = LabelEncoder()
-    click_with_features['user_idx'] = user_encoder.fit_transform(click_with_features['user_id'])
+    user_encoder.fit(user_df['user_id'].values)
+    click_with_features['user_idx'] = user_encoder.transform(click_with_features['user_id'])
     
-    # 物品ID编码
     item_encoder = LabelEncoder()
-    click_with_features['item_idx'] = item_encoder.fit_transform(click_with_features['click_article_id'])
+    item_encoder.fit(item_df['click_article_id'].values)
+    click_with_features['item_idx'] = item_encoder.transform(click_with_features['click_article_id'])
     
     # 用户特征列
     user_feat_cols = ['click_count', 'unique_articles', 'avg_time_diff', 
@@ -113,7 +116,7 @@ def build_feature_matrix(
     item_feat_cols = ['click_count', 'unique_users', 'avg_timestamp', 
                       'time_popularity', 'click_per_user']
     
-    # 标准化
+    # 标准化（矩阵行与 user_df/item_df 对齐）
     from sklearn.preprocessing import StandardScaler
     user_scaler = StandardScaler()
     item_scaler = StandardScaler()

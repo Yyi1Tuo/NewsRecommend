@@ -5,15 +5,12 @@ __all__ = [
     "data",
     "similarity",
     "recall",
-    "usercf",
-    "recall_strategies",
-    "multi_recall",
     "features",
-    "two_tower",
     "submit",
-    "pipeline",
+    "pipeline_optimized",
+    "two_tower_gpu",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 

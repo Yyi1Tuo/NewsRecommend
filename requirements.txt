@@ -11,6 +11,10 @@ torch>=2.0.0
 # 如果有CUDA，使用以下命令安装PyTorch:
 # pip install torch --index-url https://download.pytorch.org/whl/cu118
 
+# 召回加速（可选，优先使用；未安装会自动回退到 torch.topk）
+# 建议在 conda 环境安装 faiss-gpu（或 faiss-cpu）。
+faiss-cpu>=1.7.4
+
 # 系统监控
 psutil>=5.9.0
 

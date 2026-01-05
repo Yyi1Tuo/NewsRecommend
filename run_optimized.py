@@ -11,6 +11,7 @@ GPU 版运行脚本（只保留 GPU 路径）
 """
 import argparse
 import sys
+from pathlib import Path
 import torch
 
 
@@ -59,10 +60,26 @@ def main():
     parser.add_argument('--no-amp', action='store_true', help='关闭 AMP（默认开启，建议保留）')
     parser.add_argument('--w-itemcf', type=float, default=0.8, help='融合权重：ItemCF（默认 0.8）')
     parser.add_argument('--w-tt', type=float, default=0.2, help='融合权重：TwoTower（默认 0.2）')
+
+    # 日志输出（后台训练建议开启）
+    parser.add_argument('--log-dir', type=str, default='temp_results/logs', help='日志目录（默认 temp_results/logs）')
+    parser.add_argument('--log-prefix', type=str, default='run', help='日志文件名前缀（默认 run）')
+    parser.add_argument('--no-tee', action='store_true', help='不输出到终端（只写日志文件）')
     
     args = parser.parse_args()
     
     _require_cuda()
+
+    # 设置 stdout/stderr -> 日志文件
+    from src.log_utils import build_log_path, setup_std_stream_logging
+    log_paths = build_log_path(
+        log_dir=Path(args.log_dir),
+        mode=args.mode,
+        is_train=bool(args.train),
+        prefix=args.log_prefix,
+    )
+    setup_std_stream_logging(log_paths.log_file, tee_to_console=(not args.no_tee))
+    print(f"[log] {log_paths.log_file}")
     
     # 运行
     from src.pipeline_optimized import run_multi_gpu

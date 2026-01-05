@@ -37,6 +37,12 @@ dataset/
 *.pkl
 *.h5
 
+test_results/
+.index
+.pkl
+.pth
+.csv
+
 # 虚拟环境
 venv/
 .env

@@ -42,7 +42,7 @@ test_results/
 .pkl
 .pth
 .csv
-
+.npy
 # 虚拟环境
 venv/
 .env

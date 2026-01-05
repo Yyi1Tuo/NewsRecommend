@@ -1,7 +1,7 @@
 """双塔模型 GPU 优化版本 - 使用 PyTorch"""
 import pickle
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Iterable
+from typing import Dict, List, Tuple, Optional, Iterable, Sequence
 import gc
 
 import numpy as np
@@ -105,62 +105,144 @@ class InteractionDataset(Dataset):
         )
 
 
-class UserTower(nn.Module):
+class PosPairDataset(Dataset):
+    """正样本对数据集：仅 (user_feat, item_feat)，用于 in-batch negatives 的 listwise 训练"""
+    def __init__(self, pos_pairs: np.ndarray, user_features: np.ndarray, item_features: np.ndarray):
+        # pos_pairs: shape (N,2) -> (user_idx, item_idx)
+        self.pos_pairs = pos_pairs.astype(np.int64, copy=False)
+        self.user_features = user_features.astype(np.float32, copy=False)
+        self.item_features = item_features.astype(np.float32, copy=False)
+
+    def __len__(self):
+        return len(self.pos_pairs)
+
+    def __getitem__(self, idx):
+        u, i = self.pos_pairs[idx]
+        return (
+            torch.from_numpy(self.user_features[int(u)]),
+            torch.from_numpy(self.item_features[int(i)]),
+        )
+
+
+class MLPTower(nn.Module):
+    """通用 MLP Tower（更深、更稳定：LayerNorm + Dropout）"""
+    def __init__(
+        self,
+        input_dim: int,
+        embedding_dim: int = 64,
+        hidden_dims: Sequence[int] = (256, 128),
+        dropout: float = 0.2,
+    ):
+        super().__init__()
+        dims = [input_dim] + list(hidden_dims)
+        layers: List[nn.Module] = []
+        for in_d, out_d in zip(dims[:-1], dims[1:]):
+            layers.append(nn.Linear(in_d, out_d))
+            layers.append(nn.LayerNorm(out_d))
+            layers.append(nn.ReLU(inplace=True))
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+        layers.append(nn.Linear(dims[-1], embedding_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.net(x)
+        return F.normalize(x, p=2, dim=1)
+
+
+class UserTower(MLPTower):
     """用户塔"""
-    def __init__(self, input_dim, embedding_dim=64):
-        super().__init__()
-        self.fc1 = nn.Linear(input_dim, 128)
-        self.bn1 = nn.BatchNorm1d(128)
-        self.fc2 = nn.Linear(128, embedding_dim)
-        self.dropout = nn.Dropout(0.2)
-    
-    def forward(self, x):
-        x = F.relu(self.bn1(self.fc1(x)))
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return F.normalize(x, p=2, dim=1)  # L2归一化
+    pass
 
 
-class ItemTower(nn.Module):
+class ItemTower(MLPTower):
     """物品塔"""
-    def __init__(self, input_dim, embedding_dim=64):
-        super().__init__()
-        self.fc1 = nn.Linear(input_dim, 128)
-        self.bn1 = nn.BatchNorm1d(128)
-        self.fc2 = nn.Linear(128, embedding_dim)
-        self.dropout = nn.Dropout(0.2)
-    
-    def forward(self, x):
-        x = F.relu(self.bn1(self.fc1(x)))
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return F.normalize(x, p=2, dim=1)  # L2归一化
+    pass
 
 
 class TwoTowerModelGPU(nn.Module):
     """双塔模型 GPU版本"""
-    def __init__(self, user_dim, item_dim, embedding_dim=64):
+    def __init__(
+        self,
+        user_dim: int,
+        item_dim: int,
+        embedding_dim: int = 64,
+        hidden_dims: Sequence[int] = (256, 128),
+        dropout: float = 0.2,
+        num_users: int = 0,
+        num_items: int = 0,
+        user_id_emb_dim: int = 64,
+        item_id_emb_dim: int = 250,
+        item_id_init: Optional[np.ndarray] = None,
+    ):
         super().__init__()
-        self.user_tower = UserTower(user_dim, embedding_dim)
-        self.item_tower = ItemTower(item_dim, embedding_dim)
+        # ID Embeddings（真正的双塔核心信号）
+        if num_users <= 0 or num_items <= 0:
+            raise ValueError("num_users/num_items must be provided for ID-embedding two-tower")
+        self.user_id_emb = nn.Embedding(num_users, user_id_emb_dim)
+        self.item_id_emb = nn.Embedding(num_items, item_id_emb_dim)
+        if item_id_init is not None:
+            init = np.asarray(item_id_init, dtype=np.float32)
+            if init.shape != (num_items, item_id_emb_dim):
+                raise ValueError(f"item_id_init shape {init.shape} != ({num_items},{item_id_emb_dim})")
+            with torch.no_grad():
+                self.item_id_emb.weight.copy_(torch.from_numpy(init))
+
+        # 数值特征分支（小型 MLP 到中间维度）
+        self.user_num_proj = nn.Sequential(
+            nn.Linear(user_dim, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+        )
+        self.item_num_proj = nn.Sequential(
+            nn.Linear(item_dim, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+        )
+
+        # ID embedding 投影（将 250-d articles_emb 压到更合适的融合维度）
+        self.user_id_proj = nn.Sequential(
+            nn.Linear(user_id_emb_dim, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(inplace=True),
+        )
+        self.item_id_proj = nn.Sequential(
+            nn.Linear(item_id_emb_dim, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(inplace=True),
+        )
+
+        # 融合后的 tower（concat 后再 MLP -> embedding_dim）
+        self.user_tower = UserTower(64 + 64, embedding_dim=embedding_dim, hidden_dims=hidden_dims, dropout=dropout)
+        self.item_tower = ItemTower(128 + 64, embedding_dim=embedding_dim, hidden_dims=hidden_dims, dropout=dropout)
         self.embedding_dim = embedding_dim
     
-    def forward(self, user_feat, item_feat):
-        user_emb = self.user_tower(user_feat)
-        item_emb = self.item_tower(item_feat)
+    def encode_user(self, user_idx: torch.Tensor, user_num_feat: torch.Tensor) -> torch.Tensor:
+        uid = self.user_id_proj(self.user_id_emb(user_idx))
+        unum = self.user_num_proj(user_num_feat)
+        return self.user_tower(torch.cat([uid, unum], dim=1))
+
+    def encode_item(self, item_idx: torch.Tensor, item_num_feat: torch.Tensor) -> torch.Tensor:
+        iid = self.item_id_proj(self.item_id_emb(item_idx))
+        inum = self.item_num_proj(item_num_feat)
+        return self.item_tower(torch.cat([iid, inum], dim=1))
+
+    def forward(self, user_idx, user_num_feat, item_idx, item_num_feat):
+        user_emb = self.encode_user(user_idx, user_num_feat)
+        item_emb = self.encode_item(item_idx, item_num_feat)
         # 余弦相似度（已归一化，直接点积）
         score = torch.sum(user_emb * item_emb, dim=1)
         return score
     
-    def get_user_embedding(self, user_feat):
-        """获取用户向量"""
-        with torch.no_grad():
-            return self.user_tower(user_feat)
+    def get_user_embedding(self, user_idx: torch.Tensor, user_num_feat: torch.Tensor):
+        """获取用户向量（推理时建议外层包 torch.no_grad()）"""
+        return self.encode_user(user_idx, user_num_feat)
     
-    def get_item_embedding(self, item_feat):
-        """获取物品向量"""
-        with torch.no_grad():
-            return self.item_tower(item_feat)
+    def get_item_embedding(self, item_idx: torch.Tensor, item_num_feat: torch.Tensor):
+        """获取物品向量（推理时建议外层包 torch.no_grad()）"""
+        return self.encode_item(item_idx, item_num_feat)
 
 
 def train_two_tower_gpu(
@@ -337,6 +419,162 @@ def train_two_tower_gpu(
     return model
 
 
+def train_two_tower_inbatch_gpu(
+    all_click_df: pd.DataFrame,
+    user_features: np.ndarray,
+    item_features: np.ndarray,
+    encoders: Dict,
+    epochs: int = 5,
+    batch_size: int = 2048,
+    device: str = "cuda",
+    lr: float = 1e-3,
+    temperature: float = 0.07,
+    hidden_dims: Sequence[int] = (256, 128),
+    dropout: float = 0.2,
+    symmetric_loss: bool = False,
+    steps_per_epoch: Optional[int] = None,
+    use_amp: bool = True,
+) -> TwoTowerModelGPU:
+    """
+    In-batch negatives 的 listwise 训练（交叉熵）：
+    logits = (u_emb @ v_emb^T) / temperature, target=diag
+    """
+    # 关键：listwise in-batch CE 要求 batch 内的对角配对是“唯一正样本”。
+    # 但真实数据里同一 user 会出现多次；若同一 user 在同一 batch 出现多个不同 item，
+    # 会把另外一个“真正的正样本”当作负样本，造成强噪声，导致完全不收敛。
+    # 解决：每个 batch 采样唯一 user，每个 user 随机采样一个正样本 item。
+    click_data = encoders["click_with_features"][["user_idx", "item_idx"]].drop_duplicates()
+    user_to_items: Dict[int, np.ndarray] = (
+        click_data.groupby("user_idx")["item_idx"].apply(lambda x: x.values).to_dict()
+    )
+    unique_users = np.fromiter(user_to_items.keys(), dtype=np.int64)
+    if len(unique_users) < batch_size:
+        raise ValueError(f"unique users ({len(unique_users)}) < batch_size ({batch_size})")
+
+    # item embedding 用 articles_emb 初始化（250维）
+    try:
+        from .features import load_or_build_articles_emb_matrix
+        item_ids_by_index = np.asarray(encoders["item_encoder"].classes_, dtype=np.int64)
+        item_id_init = load_or_build_articles_emb_matrix(item_ids_by_index=item_ids_by_index)
+    except Exception:
+        item_id_init = None
+
+    model = TwoTowerModelGPU(
+        user_dim=user_features.shape[1],
+        item_dim=item_features.shape[1],
+        embedding_dim=64,
+        hidden_dims=hidden_dims,
+        dropout=dropout,
+        num_users=len(encoders["user_encoder"].classes_),
+        num_items=len(encoders["item_encoder"].classes_),
+        user_id_emb_dim=64,
+        item_id_emb_dim=250,
+        item_id_init=item_id_init,
+    ).to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    ce = nn.CrossEntropyLoss()
+
+    if steps_per_epoch is None:
+        # 不要让 epoch 变成“一个 epoch 只有很少 step”的形式；默认给足更新次数
+        steps_per_epoch = max(500, int(len(click_data) / batch_size))
+    print(
+        f"开始训练双塔(in-batch CE): epochs={epochs}, batch_size={batch_size}, "
+        f"steps/epoch={steps_per_epoch}, temp={temperature}, lr={lr}, device={device}"
+    )
+    # torch.cuda.amp.* 已逐步弃用，使用 torch.amp.*（兼容 CUDA AMP）
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp and device == "cuda")
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0.0
+        steps = 0
+        diag_mean = 0.0
+        off_max_mean = 0.0
+        acc1 = 0.0
+
+        pbar = tqdm(range(steps_per_epoch), desc=f"Epoch {epoch+1}/{epochs}")
+        for _ in pbar:
+            # 采样 batch_size 个唯一 user
+            batch_users = np.random.choice(unique_users, size=batch_size, replace=False)
+            # 每个 user 随机采样一个正样本 item
+            batch_items = np.empty(batch_size, dtype=np.int64)
+            for k, u in enumerate(batch_users):
+                items = user_to_items[int(u)]
+                batch_items[k] = int(items[np.random.randint(0, len(items))])
+
+            user_idx = torch.from_numpy(batch_users).to(device=device, dtype=torch.long)
+            item_idx = torch.from_numpy(batch_items).to(device=device, dtype=torch.long)
+            user_num = torch.from_numpy(user_features[batch_users].astype(np.float32, copy=False)).to(device)
+            item_num = torch.from_numpy(item_features[batch_items].astype(np.float32, copy=False)).to(device)
+
+            with torch.amp.autocast("cuda", enabled=use_amp and device == "cuda"):
+                u = model.get_user_embedding(user_idx, user_num)   # (B,D)
+                v = model.get_item_embedding(item_idx, item_num)   # (B,D)
+
+                logits = torch.matmul(u, v.t()) / temperature
+                target = torch.arange(logits.size(0), device=device)
+
+                loss = ce(logits, target)
+                if symmetric_loss:
+                    loss = 0.5 * (loss + ce(logits.t(), target))
+
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+
+            with torch.no_grad():
+                steps += 1
+                total_loss += loss.item()
+                diag = torch.diagonal(logits)
+                diag_mean += diag.mean().item()
+                # 每行最大负样本（排除对角）
+                neg = logits.clone()
+                # AMP 下 logits 可能是 fp16/bf16，不能用 -1e9（会溢出），用该 dtype 可表示的最小值
+                neg.fill_diagonal_(torch.finfo(neg.dtype).min)
+                off_max = neg.max(dim=1).values
+                off_max_mean += off_max.mean().item()
+                pred = logits.argmax(dim=1)
+                acc1 += (pred == target).float().mean().item()
+
+                pbar.set_postfix({
+                    "loss": f"{(total_loss/steps):.4f}",
+                    "pos": f"{(diag_mean/steps):.3f}",
+                    "neg_max": f"{(off_max_mean/steps):.3f}",
+                    "acc@1": f"{(acc1/steps):.3f}",
+                })
+
+        print(
+            f"Epoch {epoch+1}/{epochs}: "
+            f"loss={total_loss/max(steps,1):.4f}, "
+            f"pos={diag_mean/max(steps,1):.3f}, "
+            f"neg_max={off_max_mean/max(steps,1):.3f}, "
+            f"acc@1={acc1/max(steps,1):.3f}"
+        )
+
+    print("双塔模型训练完成(in-batch)")
+    torch.save(model.state_dict(), SAVE_PATH / "two_tower_gpu.pth")
+
+    # 预计算物品向量
+    model.eval()
+    item_embeddings = []
+    item_idx_all = torch.arange(len(item_features), device=device, dtype=torch.long)
+    item_num_all = torch.FloatTensor(item_features).to(device)
+    with torch.no_grad():
+        for i in range(0, len(item_num_all), batch_size):
+            idx_b = item_idx_all[i:i + batch_size]
+            num_b = item_num_all[i:i + batch_size]
+            emb = model.get_item_embedding(idx_b, num_b).cpu().numpy()
+            item_embeddings.append(emb)
+    item_embeddings = np.vstack(item_embeddings)
+    with open(SAVE_PATH / "item_embeddings_gpu.pkl", "wb") as f:
+        pickle.dump(item_embeddings, f)
+    print(f"物品向量已保存: shape={item_embeddings.shape}")
+    return model
+
+
 def two_tower_recall_gpu(
     user_id: int,
     user_features_dict: Dict[int, np.ndarray],
@@ -355,9 +593,11 @@ def two_tower_recall_gpu(
     
     model.eval()
     with torch.no_grad():
-        # 用户特征
-        user_feat = torch.FloatTensor(user_features_dict[user_id]).unsqueeze(0).to(device)
-        user_emb = model.get_user_embedding(user_feat).cpu().numpy()[0]
+        # 兼容旧接口：dict 里存的是 (user_idx, user_num_feat)
+        user_idx, user_num = user_features_dict[user_id]
+        user_idx_t = torch.tensor([int(user_idx)], device=device, dtype=torch.long)
+        user_num_t = torch.as_tensor(user_num, device=device, dtype=torch.float32).unsqueeze(0)
+        user_emb = model.get_user_embedding(user_idx_t, user_num_t).cpu().numpy()[0]
         
         # 与所有物品计算相似度（原始实现：每用户全量 dot + 全排序，较慢）
         # 仍保留以兼容旧代码；推荐改用 two_tower_recall_batch_* 接口。
@@ -433,8 +673,12 @@ def two_tower_recall_batch(
                 continue
 
             v_uids, v_rows = zip(*valid)
-            u_feat = torch.from_numpy(user_features[np.array(v_rows, dtype=np.int64)].astype(np.float32)).to(device)
-            u_emb = model.get_user_embedding(u_feat)  # (B, D) 已normalize
+            # 兼容两种模式：
+            # - 旧：row 是 user_features 的行索引
+            # - 新：row 既是数值特征行索引，也是 user_id embedding 的 index（通过严格排序对齐实现）
+            u_idx = torch.from_numpy(np.array(v_rows, dtype=np.int64)).to(device=device, dtype=torch.long)
+            u_num = torch.from_numpy(user_features[np.array(v_rows, dtype=np.int64)].astype(np.float32, copy=False)).to(device)
+            u_emb = model.get_user_embedding(u_idx, u_num)  # (B, D) 已normalize
             u_emb_np = u_emb.detach().cpu().numpy().astype(np.float32)
 
             if index is not None:
@@ -476,13 +720,25 @@ def load_two_tower_model_gpu(device: str = 'cuda') -> Optional[TwoTowerModelGPU]
         user_dim = len(encoders['user_feat_cols'])
         item_dim = len(encoders['item_feat_cols'])
         
-        model = TwoTowerModelGPU(user_dim, item_dim, embedding_dim=64)
-        model.load_state_dict(torch.load(model_path, map_location=device))
+        model = TwoTowerModelGPU(
+            user_dim=user_dim,
+            item_dim=item_dim,
+            embedding_dim=64,
+            hidden_dims=(256, 128),
+            dropout=0.2,
+            num_users=len(encoders["user_encoder"].classes_),
+            num_items=len(encoders["item_encoder"].classes_),
+            user_id_emb_dim=64,
+            item_id_emb_dim=250,
+            item_id_init=None,  # 权重会被 checkpoint 覆盖；无需在加载时重复读 1GB CSV
+        )
+        state = torch.load(model_path, map_location=device)
+        model.load_state_dict(state)
         model.to(device)
         model.eval()
         
         return model
     except Exception as e:
-        print(f"加载双塔模型失败: {e}")
+        print(f"加载双塔模型失败（可能需要重训）: {e}")
         return None
 

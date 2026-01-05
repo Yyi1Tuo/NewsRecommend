@@ -31,108 +31,21 @@ def _log(msg: str):
     print(msg)
 
 
-def run_lightweight(
-    topk_submit: int = 5,
-    use_gpu: bool = True,
-    batch_size: int = 1000
-) -> Path:
-    """
-    轻量级运行模式 - 内存优化版
-    
-    Args:
-        topk_submit: 提交的 TopK
-        use_gpu: 是否使用GPU（如果可用）
-        batch_size: 每批处理的用户数
-    """
-    # 轻量模式保留，但减少冗余输出
-    t0 = perf_counter()
-    
-    # 1. 加载数据（只读必要字段）
-    _log("加载数据...")
-    all_click_df = data_mod.get_all_click_df(offline=False)
-    _log(f"点击数据: {len(all_click_df)}")
-    
-    # 2. 基础统计
-    _log("计算基础统计...")
-    user_item_time_dict = data_mod.get_user_item_time(all_click_df)
-    item_topk_click = data_mod.get_item_topk_click(all_click_df, k=ITEM_TOPK_K).tolist()
-    
-    # 获取所有用户
-    all_users = all_click_df["user_id"].unique()
-    _log(f"用户数: {len(all_users)}")
-    
-    # 3. ItemCF 相似度（如果不存在才计算）
-    _log("准备ItemCF相似度...")
-    i2i_sim = _load_or_build_i2i(all_click_df)
-    
-    # 释放不需要的数据
-    del all_click_df
-    gc.collect()
-    # no-op
-    
-    # 4. 分批召回
-    _log(f"分批召回: batch_size={batch_size}")
-    user_recall_dict = {}
-    
-    n_batches = (len(all_users) + batch_size - 1) // batch_size
-    
-    for batch_idx in range(n_batches):
-        start_idx = batch_idx * batch_size
-        end_idx = min(start_idx + batch_size, len(all_users))
-        batch_users = all_users[start_idx:end_idx]
-        
-        for user in tqdm(batch_users, desc=f"召回{batch_idx+1}/{n_batches}"):
-            recs = recall.item_based_recommend(
-                user_id=user,
-                user_item_time_dict=user_item_time_dict,
-                i2i_sim=i2i_sim,
-                sim_item_topk=SIM_ITEM_TOPK,
-                recall_item_num=RECALL_ITEM_NUM,
-                item_topk_click=item_topk_click,
-            )
-            user_recall_dict[user] = recs
-        
-        if (batch_idx + 1) % 5 == 0:
-            gc.collect()
-    
-    _log(f"召回完成: users={len(user_recall_dict)}")
-    
-    # 5. 转换为DataFrame（流式处理）
-    _log("生成提交文件...")
-    
-    # 只保留测试集用户
-    tst_click = pd.read_csv(str(DATA_PATH / "testA_click_log.csv"))
-    tst_users = set(tst_click["user_id"].unique())
-    
-    # 流式构建DataFrame
-    user_item_score_list = []
-    for user in tqdm(tst_users, desc="构建结果"):
-        if user in user_recall_dict:
-            for item, score in user_recall_dict[user]:
-                user_item_score_list.append([user, item, score])
-    
-    recall_df = pd.DataFrame(
-        user_item_score_list, 
-        columns=["user_id", "click_article_id", "pred_score"]
-    )
-    
-    _log(f"测试集召回: {len(recall_df)}")
-    
-    # 生成提交
-    submit_path = submit_mod.submit(recall_df, topk=topk_submit, model_name=f"{MODEL_NAME}_lite")
-    
-    _log(f"完成: submit={submit_path}, elapsed={perf_counter()-t0:.2f}s")
-    
-    return submit_path
-
-
 def run_multi_gpu(
     topk_submit: int = 5,
     use_itemcf: bool = True,
     use_two_tower: bool = True,
     train_two_tower: bool = False,
     batch_size: int = 500,
-    device: str = 'cuda'
+    device: str = 'cuda',
+    tt_epochs: int = 10,
+    tt_batch_size: int = 2048,
+    tt_lr: float = 1e-3,
+    tt_temperature: float = 0.07,
+    weight_itemcf: float = 0.8,
+    weight_two_tower: float = 0.2,
+    tt_steps_per_epoch: Optional[int] = None,
+    tt_use_amp: bool = True,
 ) -> Path:
     """
     多路召回 GPU优化版
@@ -155,10 +68,13 @@ def run_multi_gpu(
     # 1. 加载数据
     _log("加载数据...")
     all_click_df = data_mod.get_all_click_df(offline=False)
+    # 只需要对 testA 用户生成召回结果（巨量提速）
+    tst_click = pd.read_csv(str(DATA_PATH / "testA_click_log.csv"))
+    tst_users = sorted(set(map(int, tst_click["user_id"].unique().tolist())))
     user_item_time_dict = data_mod.get_user_item_time(all_click_df)
     item_topk_click = data_mod.get_item_topk_click(all_click_df, k=ITEM_TOPK_K).tolist()
-    all_users = all_click_df["user_id"].unique()
-    _log(f"用户: {len(all_users)}, 点击: {len(all_click_df)}")
+    all_users = np.array(tst_users, dtype=np.int64)
+    _log(f"testA用户: {len(all_users)}, 全量点击: {len(all_click_df)}")
     
     # 2. 准备召回资源
     _log("准备召回资源...")
@@ -188,14 +104,18 @@ def run_multi_gpu(
             )
             
             # 训练
-            two_tower_model = two_tower_gpu.train_two_tower_gpu(
+            two_tower_model = two_tower_gpu.train_two_tower_inbatch_gpu(
                 all_click_df,
-                user_features,
-                item_features,
+                user_features.astype(np.float32, copy=False),
+                item_features.astype(np.float32, copy=False),
                 encoders,
-                epochs=3,  # 减少epoch
-                batch_size=2048,  # 增大batch减少迭代
-                device=device
+                epochs=tt_epochs,
+                batch_size=tt_batch_size,
+                lr=tt_lr,
+                temperature=tt_temperature,
+                device=device,
+                steps_per_epoch=tt_steps_per_epoch,
+                use_amp=tt_use_amp,
             )
             
             # 清理
@@ -208,20 +128,42 @@ def run_multi_gpu(
             from . import features as feat_mod
             
             two_tower_model = two_tower_gpu.load_two_tower_model_gpu(device)
-            
+            if two_tower_model is None:
+                _log("已有模型与当前结构不兼容，触发重训...")
+                return run_multi_gpu(
+                    topk_submit=topk_submit,
+                    use_itemcf=use_itemcf,
+                    use_two_tower=use_two_tower,
+                    train_two_tower=True,
+                    batch_size=batch_size,
+                    device=device,
+                )
+
+            if not (SAVE_PATH / 'item_embeddings_gpu.pkl').exists():
+                _log("缺少 item_embeddings_gpu.pkl，触发重训以生成向量...")
+                return run_multi_gpu(
+                    topk_submit=topk_submit,
+                    use_itemcf=use_itemcf,
+                    use_two_tower=use_two_tower,
+                    train_two_tower=True,
+                    batch_size=batch_size,
+                    device=device,
+                )
+
             with open(SAVE_PATH / 'item_embeddings_gpu.pkl', 'rb') as f:
                 item_embeddings = pickle.load(f)
             
             encoders = feat_mod.load_feature_encoders()
             item_encoder = encoders['item_encoder']
 
-            # 构建用户特征矩阵（与 encoders 对齐）
-            user_df = feat_mod.extract_user_features(all_click_df)
+            # 构建用户数值特征矩阵（严格对齐 user_encoder.classes_，row==user_idx）
+            user_encoder = encoders["user_encoder"]
+            user_df = feat_mod.extract_user_features(all_click_df).sort_values("user_id").reset_index(drop=True)
             user_feat_cols = encoders['user_feat_cols']
             user_scaler = encoders['user_scaler']
-            user_features = user_scaler.transform(user_df[user_feat_cols].fillna(0)).astype(np.float32)
-            user_ids = user_df['user_id'].values
-            user_id_to_row = {int(uid): int(i) for i, uid in enumerate(user_ids)}
+            user_features = user_scaler.transform(user_df[user_feat_cols].fillna(0)).astype(np.float32, copy=False)
+            # row index == user_idx == user_encoder.classes_ index
+            user_id_to_row = {int(uid): int(i) for i, uid in enumerate(user_encoder.classes_)}
 
             item_ids_by_index = getattr(item_encoder, "classes_", None)
             if item_ids_by_index is None:
@@ -320,7 +262,7 @@ def run_multi_gpu(
                     norm_items = items
                 
                 # 加权
-                weight = 0.5 if strategy == 'itemcf' else 0.5  # 平等权重
+                weight = weight_itemcf if strategy == 'itemcf' else weight_two_tower
                 for item, norm_score in norm_items:
                     item_scores[item] += weight * norm_score
             
@@ -343,11 +285,8 @@ def run_multi_gpu(
     
     # 4. 构建结果
     _log("构建提交...")
-    tst_click = pd.read_csv(str(DATA_PATH / "testA_click_log.csv"))
-    tst_users = set(tst_click["user_id"].unique())
-    
     user_item_score_list = []
-    for user in tqdm(tst_users, desc="构建"):
+    for user in tqdm(all_users.tolist(), desc="构建"):
         if user in user_recall_dict:
             for item, score in user_recall_dict[user]:
                 user_item_score_list.append([user, item, score])
@@ -370,10 +309,25 @@ def run_multi_gpu(
 def _load_or_build_i2i(all_click_df: pd.DataFrame) -> Dict[int, Dict[int, float]]:
     """加载或构建ItemCF相似度"""
     sim_path = SAVE_PATH / I2I_SIM_FILENAME
-    if sim_path.exists():
-        print("加载ItemCF相似度...")
-        with open(sim_path, "rb") as f:
+    sorted_path = SAVE_PATH / f"itemcf_i2i_sim_sorted_top{SIM_ITEM_TOPK}.pkl"
+    if sorted_path.exists():
+        with open(sorted_path, "rb") as f:
             return pickle.load(f)
-    print("计算ItemCF相似度...")
-    return similarity.itemcf_sim(all_click_df)
+    if sim_path.exists():
+        with open(sim_path, "rb") as f:
+            raw = pickle.load(f)
+    else:
+        raw = similarity.itemcf_sim(all_click_df)
+
+    # 预排序 + 截断（避免召回阶段反复排序）
+    sorted_sim = {
+        int(i): sorted(related.items(), key=lambda x: x[1], reverse=True)[:SIM_ITEM_TOPK]
+        for i, related in raw.items()
+    }
+    try:
+        with open(sorted_path, "wb") as f:
+            pickle.dump(sorted_sim, f)
+    except Exception:
+        pass
+    return sorted_sim
 

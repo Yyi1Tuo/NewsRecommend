@@ -1,10 +1,10 @@
 """特征工程模块 - 为双塔模型提取用户和物品特征"""
 import pickle
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import LabelEncoder
-from .config import SAVE_PATH
+from .config import SAVE_PATH, DATA_PATH
 
 
 def extract_user_features(all_click_df: pd.DataFrame) -> pd.DataFrame:
@@ -93,6 +93,10 @@ def build_feature_matrix(
     构建用户-物品特征矩阵用于双塔模型训练
     返回：(user_features, item_features, encoders)
     """
+    # 排序以确保 encoder/classes_ 与特征矩阵行严格一致
+    user_df = user_df.sort_values("user_id").reset_index(drop=True)
+    item_df = item_df.sort_values("click_article_id").reset_index(drop=True)
+
     # 合并特征（训练样本用）
     click_with_features = all_click_df.merge(user_df, on='user_id', how='left')
     click_with_features = click_with_features.merge(item_df, on='click_article_id', how='left')
@@ -145,4 +149,34 @@ def load_feature_encoders():
     """加载特征编码器"""
     with open(SAVE_PATH / 'feature_encoders.pkl', 'rb') as f:
         return pickle.load(f)
+
+
+def load_or_build_articles_emb_matrix(
+    item_ids_by_index: np.ndarray,
+    cache_path: Optional[str] = None
+) -> np.ndarray:
+    """
+    读取 dataset/articles_emb.csv 并对齐到 item_ids_by_index（即 item_encoder.classes_ 的顺序）。
+    返回 float32 矩阵 shape = (num_items, 250)
+    """
+    if cache_path is None:
+        cache_path = str(SAVE_PATH / "articles_emb_aligned.npy")
+    try:
+        arr = np.load(cache_path, mmap_mode="r")
+        if arr.shape[0] == len(item_ids_by_index) and arr.shape[1] == 250:
+            return np.asarray(arr, dtype=np.float32)
+    except Exception:
+        pass
+
+    csv_path = DATA_PATH / "articles_emb.csv"
+    usecols = ["article_id"] + [f"emb_{i}" for i in range(250)]
+    df = pd.read_csv(str(csv_path), usecols=usecols)
+    df = df.set_index("article_id")
+    aligned = df.reindex(item_ids_by_index).fillna(0.0).to_numpy(dtype=np.float32, copy=False)
+
+    try:
+        np.save(cache_path, aligned)
+    except Exception:
+        pass
+    return aligned
 
